@@ -5,109 +5,207 @@
 [![Architecture](https://img.shields.io/badge/Sync_Engine-RGA_CRDT-brightgreen.svg)](#architecture)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-CollabEditor is a real-time collaborative text editor engine designed around a Replicable Growable Array (RGA) Conflict-Free Replicated Data Type (CRDT). The planned system uses modern C++20 and WebSockets to provide strong eventual consistency across distributed clients without operational transformation or lock contention.
+# collab-editor
 
-> **Project status:** The repository currently contains the project structure and documentation scaffold. The engine, client, tests, and deployment files are being built incrementally.
+A production-grade, real-time collaborative text editor powered by an **RGA (Replicated Growable Array) CRDT** — the same class of algorithm behind Google Docs and Figma's text engine. Multiple users can type simultaneously on the same document with zero conflicts and guaranteed convergence, no locks or server-side merge logic required.
 
-## Features
+---
 
-- **Conflict-free synchronization:** RGA-based state convergence for edits received out of order.
-- **Non-blocking networking:** Bidirectional event streaming through asynchronous WebSocket I/O.
-- **Deterministic ordering:** Node identifiers use `<LamportTimestamp, ClientID, LocalSequence>` keys.
-- **Persistent recovery:** An append-only write-ahead log (WAL) is planned for crash recovery.
-- **Tombstone lifecycle:** Logical deletion preserves causal parent references.
+## What is a CRDT and why does it matter here?
 
-## Technology Stack
+In a naive collaborative editor, if User A in Gorakhpur and User B in Tokyo both insert a character at position 5 at the same millisecond, the server receives two operations in different orders depending on network delay. The documents diverge.
 
-| Layer | Technology | Purpose |
-| --- | --- | --- |
-| Core engine | C++20 | RGA management and application logic |
-| Networking | uWebSockets / libuv | Asynchronous WebSocket communication |
-| Serialization | Protocol Buffers / FlatBuffers | Compact network payloads |
-| Build system | CMake 3.20+ | Cross-platform builds |
-| Containerization | Docker | Reproducible deployment |
-| Frontend | React + Monaco Editor | Browser-based editing interface |
+An **RGA CRDT** solves this by giving every inserted character a globally unique, causally ordered identity:
+
+```
+NodeID = ⟨ Lamport Timestamp, Client ID, Local Sequence ⟩
+```
+
+Characters are never re-indexed when text changes. Insert and delete operations are commutative and idempotent — apply them in any order, on any replica, and every peer converges to the same document. This property is called **Strong Eventual Consistency (SEC)**.
+
+---
 
 ## Architecture
 
-```text
-Client 1 (Monaco UI) ──┐
-                       ├── WebSockets ──> C++ WebSocket Event Engine
-Client 2 (Monaco UI) ──┘                         │
-                                                 ▼
-                                      In-memory RGA Sequence CRDT
-                                                 │
-                                                 ▼
-                                      Append-only WAL Persistence
+```
+ ┌──────────────────────────────────────────────┐
+ │              BROWSER CLIENT                  │
+ │  React 18 + TypeScript + Optimistic Engine   │
+ └──────────────────────┬───────────────────────┘
+                        │
+                        │  34-byte Binary WebSocket Frames
+                        ▼
+ ┌──────────────────────────────────────────────┐
+ │                NGINX PROXY                   │
+ │     TLS Termination + WebSocket Upgrades     │
+ └──────────────────────┬───────────────────────┘
+                        │
+                        ▼
+ ┌──────────────────────────────────────────────┐
+ │             C++17 BACKEND ENGINE             │
+ │    uWebSockets Async Reactor (Thread-Safe)   │
+ ├──────────────────────────────────────────────┤
+ │  Multi-Room Document Manager                 │
+ │  Causal Operations Buffer                    │
+ │  Memory-Mapped Write-Ahead Log (WAL)         │
+ └──────────────────────────────────────────────┘
 ```
 
-## Repository Structure
+### Key subsystems
 
-```text
+**Dual CRDT engines.** The TypeScript client engine applies edits locally before they hit the network — zero-latency rendering. The C++ server engine acts as the authoritative state validator, clock manager, and pub/sub broadcaster.
+
+**Binary wire protocol.** Every operation is encoded as a fixed 34-byte `#pragma pack(push, 1)` frame. Approximately 10× smaller than equivalent JSON, with no parsing overhead or garbage collection pressure.
+
+**Causal buffering.** If an operation arrives referencing a character that hasn't been received yet ("insert X after Y, but Y is still in transit"), the engine parks X in a pending buffer and splices it in automatically the moment Y arrives. This makes the system correct on high-latency and lossy networks.
+
+**Write-Ahead Log.** All edits are sequentially appended to a binary disk log. On server restart, the document state is reconstructed from the WAL with no data loss.
+
+**Multi-room document manager.** Each document gets an isolated WebSocket room at `/ws/{documentId}`. Rooms are created and destroyed dynamically.
+
+---
+
+## Keystroke lifecycle
+
+```
+[User types 'A']
+  → 1.  Local insert in client RGA list
+  → 2.  Render instantly on screen  (0ms UI lag)
+  → 3.  Encode to 34-byte ArrayBuffer
+  → 4.  Send over WebSocket
+  → 5.  C++ server receives binary frame
+  → 6.  Server advances Lamport clock, applies to server RGA
+  → 7.  Append operation to WAL
+  → 8.  Broadcast frame to all room peers
+  → 9.  Remote clients decode and integrate into their local RGA
+```
+
+---
+
+## Performance targets
+
+| Concern | Approach | Outcome |
+|---|---|---|
+| Conflict resolution | RGA deterministic ordering via Lamport + Client ID tie-breaking | Guaranteed convergence across all replicas |
+| Payload size | Fixed 34-byte packed binary frames | ~10× smaller than JSON equivalents |
+| Network reordering | Causal dependency buffering | Correct on lossy and out-of-order networks |
+| Local edit cost | Memory index + doubly-linked list | O(1) cursor ops; O(N) full render |
+| Server throughput | Non-blocking uWebSockets event loop | Tens of thousands of concurrent WS frames/sec |
+
+---
+
+## Project structure
+
+```
 collab-editor/
-├── client/       # React and Monaco Editor client
-├── server/       # Collaborative editing server
-├── deploy/       # Deployment configuration
-├── nginx/        # Reverse-proxy configuration
-├── LICENSE
-└── README.md
+├── server/                  # C++17 backend
+│   ├── include/
+│   │   ├── node_id.h        # NodeID type and ordering
+│   │   ├── rga_node.h       # Individual RGA list node
+│   │   ├── rga_list.h       # Core RGA sequence structure
+│   │   ├── crdt_engine.h    # Engine: clock, buffer, broadcast
+│   │   ├── spsc_queue.h     # Lock-free single-producer queue
+│   │   ├── wal.h            # Write-ahead log
+│   │   ├── document_manager.h
+│   │   ├── session_manager.h
+│   │   ├── protocol.h       # 34-byte binary wire format
+│   │   └── config.h
+│   ├── src/
+│   │   ├── main.cpp
+│   │   ├── server.cpp
+│   │   ├── document_manager.cpp
+│   │   └── session_manager.cpp
+│   ├── tests/
+│   │   ├── test_node_id.cpp       # NodeID ordering invariants
+│   │   ├── test_rga.cpp           # List manipulation
+│   │   ├── test_engine.cpp        # Causal buffer behaviour
+│   │   ├── test_convergence.cpp   # Multi-replica random shuffle
+│   │   └── test_protocol.cpp      # Binary encode/decode round-trips
+│   └── third_party/uWebSockets/
+│
+├── client/                  # React 18 + TypeScript frontend
+│   └── src/
+│       ├── crdt/            # Client-side RGA engine
+│       │   ├── NodeID.ts
+│       │   ├── RGANode.ts
+│       │   ├── RGADocument.ts
+│       │   └── CRDTEngine.ts
+│       ├── network/         # WebSocket + binary protocol
+│       │   ├── WireProtocol.ts
+│       │   ├── ConnectionManager.ts
+│       │   └── SyncManager.ts
+│       ├── editor/          # Editor UI
+│       │   ├── Editor.tsx
+│       │   ├── EditorState.ts
+│       │   ├── Cursor.tsx
+│       │   ├── CursorOverlay.tsx
+│       │   ├── SelectionHighlight.tsx
+│       │   └── Toolbar.tsx
+│       └── components/      # App shell
+│           ├── DocumentList.tsx
+│           ├── ShareDialog.tsx
+│           ├── UserPresence.tsx
+│           ├── Header.tsx
+│           └── LoadingSpinner.tsx
+│
+├── nginx/                   # Reverse proxy config
+├── deploy/                  # Fly.io + Docker Compose prod configs
+├── docker-compose.yml
+└── Makefile
 ```
 
-## Getting Started
+---
 
-### Prerequisites
+## Running locally
 
-- GCC 11+ or Clang 13+ with C++20 support
-- CMake 3.20+
-- libuv and OpenSSL
-- Docker (optional)
-
-### Clone the repository
+**Prerequisites:** Docker, Docker Compose
 
 ```bash
-git clone https://github.com/Ashiii27/collab-editor.git
+git clone https://github.com/Ashiii27/collab-editor
 cd collab-editor
+make dev
 ```
 
-### Build from source
+This builds and starts the C++ server, React client, and Nginx proxy via Docker Compose. Open `http://localhost` in two browser windows and type in either — changes appear in both in real time.
+
+**Run the C++ test suite:**
 
 ```bash
-mkdir build
-cd build
-cmake -DCMAKE_BUILD_TYPE=Release ..
-cmake --build . --parallel
+make test
 ```
 
-### Run with Docker
+Covers NodeID ordering, RGA list manipulation, causal out-of-order buffering, binary protocol round-trips, and multi-replica convergence under random operation shuffles.
+
+---
+
+## Deployment
+
+The `deploy/` directory contains Fly.io manifests and a production Docker Compose file. To deploy to Fly.io:
 
 ```bash
-docker build -t collab-editor:latest .
-docker run -d -p 9001:9001 --name collab_service collab-editor:latest
+fly launch --config deploy/fly.toml
+fly deploy
 ```
 
-## Wire Protocol
+The production compose file (`deploy/docker-compose.prod.yml`) wires up TLS termination through Nginx and mounts a persistent WAL volume on the server container.
 
-WebSocket events are planned to use a binary or packed JSON frame with the following fields:
+---
 
-| Field | Type | Description |
-| --- | --- | --- |
-| `type` | `uint8_t` | `0x01` Insert, `0x02` Delete, or `0x03` Sync Document |
-| `lamport` | `uint64_t` | Sender's current Lamport timestamp |
-| `client_id` | `uint32_t` | Unique client connection identifier |
-| `seq` | `uint32_t` | Monotonic local sequence number |
-| `parent_id` | `NodeID` | Target parent node key: `<Lamport, ClientID, Seq>` |
-| `value` | `char` | Inserted character payload |
+## Tech stack
 
-## Performance Targets
+| Layer | Technology |
+|---|---|
+| Backend engine | C++17, uWebSockets, CMake |
+| Persistence | Memory-mapped binary WAL |
+| Frontend | React 18, TypeScript, Vite |
+| Proxy | Nginx |
+| Containerisation | Docker, Docker Compose |
+| Deployment | Fly.io |
 
-- Local operation latency: $\mathcal{O}(1)$ with an active editor cursor reference.
-- Remote integration complexity: $\mathcal{O}(k)$, where $k$ is the number of concurrent edits at the target parent node.
-- Integration throughput: sub-millisecond operation processing across 1,000+ concurrent sessions.
+---
 
-## Contributing
+## References
 
-Contributions, issues, and design discussions are welcome. Please open an issue before submitting a large architectural change.
-
-## License
-
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
+- Roh et al., *Replicated abstract data types: Building blocks for collaborative applications* (2011) — original RGA paper
+- Shapiro et al., *A comprehensive study of Convergent and Commutative Replicated Data Types* (2011) — SEC formal definition
+- [uWebSockets](https://github.com/uNetworking/uWebSockets)

@@ -5,6 +5,7 @@ BUILD_TYPE ?= Debug
 
 all: build
 
+
 configure:
 	cmake -S . -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) -DCOLLAB_EDITOR_BUILD_TESTS=ON
 

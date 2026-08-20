@@ -2,7 +2,7 @@
 
 This document turns the architecture described in [`README.md`](README.md) into an incremental, file-by-file delivery plan.
 
-> **Current state:** The repository contains the top-level directory scaffold and placeholder READMEs. The files below are planned implementation files and should be added in the order shown.
+> **Current state:** M0 is implemented. The repository now has a CMake build definition, a minimal C++17 foundation executable, a smoke test, Make targets, Docker/Compose scaffolding, an Nginx configuration, and subsystem documentation. M1–M6 remain planned.
 
 ## 1. Delivery principles
 
@@ -24,6 +24,8 @@ This document turns the architecture described in [`README.md`](README.md) into 
 | M4 — Client engine | Optimistic browser-side editing and sync | Local edits render immediately and reconcile after reconnect |
 | M5 — Editor experience | Usable collaborative editor | Two browser sessions edit, select, and show presence correctly |
 | M6 — Production delivery | Containerized, proxied, tested deployment | `make dev`, `make test`, and production compose work from a clean checkout |
+
+**M0 status:** Complete. The foundation executable supports `--help`, `--version`, and validated `--port` input. The direct MinGW build and smoke test pass; CMake and Docker should be run once those tools are installed.
 
 ## 3. File-wise implementation plan
 
